@@ -90,23 +90,59 @@ export default function PreviewScreen() {
         setIsUploading(true);
         try {
             const fileName = pdfUri.split('/').pop() ?? 'document.pdf';
+            // Generar planillaId (UUIDv4 simple)
+            const generateUUID = () => {
+                try {
+                    // Preferir crypto si está disponible
+                    // @ts-ignore
+                    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+                        // @ts-ignore
+                        const buf = new Uint8Array(16);
+                        // @ts-ignore
+                        crypto.getRandomValues(buf);
+                        buf[6] = (buf[6] & 0x0f) | 0x40;
+                        buf[8] = (buf[8] & 0x3f) | 0x80;
+                        const hex = Array.from(buf).map((b) => b.toString(16).padStart(2, '0'));
+                        return `${hex.slice(0, 4).join('')}-${hex.slice(4, 6).join('')}-${hex.slice(6, 8).join('')}-${hex.slice(8, 10).join('')}-${hex.slice(10, 16).join('')}`;
+                    }
+                } catch (e) {
+                    // fallthrough
+                }
+                return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+                    const r = (Math.random() * 16) | 0;
+                    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+                    return v.toString(16);
+                });
+            };
+
+            const planillaId = generateUUID();
+
+            console.debug('Enviando PDF a n8n', { pdfUri, fileName, pageCount, planillaId });
+            try {
+                const info = await FileSystem.getInfoAsync(pdfUri);
+                console.debug('PDF info:', info);
+            } catch (infoErr) {
+                console.warn('No se pudo obtener info del PDF:', infoErr);
+            }
+
             const result = await uploadPdfToN8n(pdfUri, {
                 fileName,
                 pageCount,
+                planillaId,
             });
 
             Alert.alert(
                 '¡Enviado!',
-                'El documento se está procesando. El Excel estará listo pronto.',
+                `El documento se está procesando. ID: ${planillaId}. El Excel estará listo pronto.`,
                 [{ text: 'OK', onPress: () => router.replace('/') }]
             );
 
             console.log("Respuesta de n8n:", result);
         } catch (err: any) {
-            console.error('Upload error', err);
+            console.error('Upload error', err, 'serverResponse:', err?.serverResponse ?? null);
             Alert.alert(
                 'Error de Envío',
-                `No se pudo conectar con el servidor de n8n. ${err?.message ?? ''}`
+                `No se pudo conectar con el servidor de n8n. ${err?.message ?? ''}\n${err?.serverResponse ? JSON.stringify(err.serverResponse) : ''}`
             );
         } finally {
             setIsUploading(false);

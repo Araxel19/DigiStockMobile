@@ -1,8 +1,8 @@
 import { Ionicons, MaterialIcons } from '@expo/vector-icons';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as ImageManipulator from 'expo-image-manipulator';
-import { useRouter } from 'expo-router';
-import React, { useRef, useState } from 'react';
+import { useRouter, useLocalSearchParams } from 'expo-router';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -40,6 +40,35 @@ export default function ScannerScreen() {
   const [isCapturing, setIsCapturing] = useState(false);
   
   const router = useRouter();
+  const params = useLocalSearchParams();
+
+  useEffect(() => {
+    if (!params || !params.photos) return;
+    try {
+      const uris = JSON.parse(params.photos as string) as string[];
+      if (!Array.isArray(uris) || uris.length === 0) return;
+
+      // Cargamos dimensiones de cada imagen y las insertamos en el estado
+      Promise.all(
+        uris.map((uri) =>
+          new Promise<PhotoData>((resolve) => {
+            Image.getSize(
+              uri,
+              (w, h) => resolve({ uri, width: w, height: h }),
+              () => resolve({ uri, width: 1000, height: 1500 })
+            );
+          })
+        )
+      )
+        .then((loaded) => {
+          // Prepend loaded images so se comporten como capturas recientes
+          setPhotos((p) => [...loaded, ...p]);
+        })
+        .catch((e) => console.error('Error loading selected images:', e));
+    } catch (e) {
+      console.error('Invalid photos param', e);
+    }
+  }, [params?.photos]);
 
   // --- Nuevo: editor de recorte interactivo (sin módulo nativo) ---
   const [cropModalVisible, setCropModalVisible] = useState(false);
