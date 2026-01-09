@@ -15,6 +15,8 @@ export default function PreviewScreen() {
     const [pdfUri, setPdfUri] = useState<string | null>(null);
     const [previewHtml, setPreviewHtml] = useState<string | null>(null);
     const [isGenerating, setIsGenerating] = useState(false);
+    const [uploadProgress, setUploadProgress] = useState<number>(0);
+    const [serverStatus, setServerStatus] = useState<string | null>(null);
     const router = useRouter();
 
     // Convertimos el parámetro de string a array
@@ -125,11 +127,22 @@ export default function PreviewScreen() {
                 console.warn('No se pudo obtener info del PDF:', infoErr);
             }
 
+            setUploadProgress(0);
+            setServerStatus('Subiendo...');
+
             const result = await uploadPdfToN8n(pdfUri, {
                 fileName,
                 pageCount,
                 planillaId,
+            }, {
+                timeoutMs: 5 * 60 * 1000, // 5 minutos
+                onUploadProgress: (p) => {
+                    setUploadProgress(p);
+                }
             });
+
+            // Si el servidor devolvió un objeto JSON con planillaId o jobId, mostrarlo
+            setServerStatus('En procesamiento en el servidor');
 
             Alert.alert(
                 '¡Enviado!',
@@ -194,7 +207,7 @@ export default function PreviewScreen() {
                 </View>
 
                 <View style={styles.headerCenter}>
-                    <ThemedText style={[styles.headerTitle, { color: headerTextColor }]}>Preview — PDF</ThemedText>
+                    <ThemedText style={[styles.headerTitle, { color: headerTextColor }]}>Planilla en PDF</ThemedText>
                     <View style={styles.headerMeta}>
                         <ThemedText style={[styles.metaText, { color: headerTextColor }]}>{pageCount} página{pageCount === 1 ? '' : 's'}</ThemedText>
                         {isGenerating && <ActivityIndicator size="small" color={headerTextColor} style={{ marginLeft: 8 }} />}
@@ -251,6 +264,18 @@ export default function PreviewScreen() {
                         {isUploading ? 'Enviando...' : 'Procesar Documento'}
                     </ThemedText>
                 </TouchableOpacity>
+
+                {/* Barra de progreso simple */}
+                {isUploading && (
+                    <View style={styles.progressWrap}>
+                        <View style={styles.progressBarBackground}>
+                            <View style={[styles.progressBarFill, { width: `${uploadProgress}%` }]} />
+                        </View>
+                        <ThemedText style={{ fontSize: 12 }}>{uploadProgress}%</ThemedText>
+                        {serverStatus && <ThemedText style={{ fontSize: 12, marginLeft: 8 }}>{serverStatus}</ThemedText>}
+                    </View>
+                )
+                }
             </View>
         </View>
     );
@@ -279,7 +304,11 @@ const styles = StyleSheet.create({
 
     buttonText: { color: 'white', fontWeight: '700' },
     sendText: { color: 'white', fontWeight: '700', fontSize: 14 },
-    openText: { color: 'white', fontWeight: '700', fontSize: 14 }
+    openText: { color: 'white', fontWeight: '700', fontSize: 14 },
+
+    progressWrap: { flexDirection: 'row', alignItems: 'center', gap: 8, marginLeft: 12 },
+    progressBarBackground: { width: 140, height: 8, backgroundColor: '#e6e9ee', borderRadius: 6, overflow: 'hidden', marginRight: 8 },
+    progressBarFill: { height: 8, backgroundColor: '#2ecc71' }
 });
 
 export const screenOptions = {
