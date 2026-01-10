@@ -6,7 +6,7 @@ import * as FileSystem from 'expo-file-system';
 import * as ImageManipulator from 'expo-image-manipulator';
 import * as Print from 'expo-print';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, Linking, Platform, StyleSheet, TouchableOpacity, View, useColorScheme } from 'react-native';
 import { WebView } from 'react-native-webview';
 
@@ -17,6 +17,8 @@ export default function PreviewScreen() {
     const [isGenerating, setIsGenerating] = useState(false);
     const [uploadProgress, setUploadProgress] = useState<number>(0);
     const [serverStatus, setServerStatus] = useState<string | null>(null);
+    const [lastPollResponse, setLastPollResponse] = useState<any | null>(null);
+    const progressAnimRef = useRef<number | null>(null);
     const router = useRouter();
 
     // Convertimos el parámetro de string a array
@@ -85,6 +87,12 @@ export default function PreviewScreen() {
     };
 
     const [isUploading, setIsUploading] = useState(false);
+    const [polling, setPolling] = useState(false);
+    const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+    const [localFileUri, setLocalFileUri] = useState<string | null>(null);
+    const pollRef = useRef<number | null>(null);
+    const fakeProgressRef = useRef<number | null>(null);
+    const polledIdRef = useRef<string | null>(null);
 
     const handleSend = async () => {
         if (!pdfUri || isGenerating || isUploading) return;
@@ -130,7 +138,8 @@ export default function PreviewScreen() {
             setUploadProgress(0);
             setServerStatus('Subiendo...');
 
-            const result = await uploadPdfToN8n(pdfUri, {
+            // Iniciamos la subida pero no esperamos antes de arrancar polling: esto permite mostrar progreso del servidor incluso si tarda en responder
+            const uploadPromise = uploadPdfToN8n(pdfUri, {
                 fileName,
                 pageCount,
                 planillaId,
@@ -141,16 +150,40 @@ export default function PreviewScreen() {
                 }
             });
 
+            // arrancar polling inmediato con el planillaId local (evita que la barra se quede en 0 si el servidor notifica progreso)
+            // También forzamos un progreso mínimo visible
+            setUploadProgress(1);
+            startPolling(planillaId);
+
+            const result = await uploadPromise;
+
             // Si el servidor devolvió un objeto JSON con planillaId o jobId, mostrarlo
             setServerStatus('En procesamiento en el servidor');
 
+            // Si el servidor incluye una URL de descarga directa, guardarla y no hacer polling
+            if (result && typeof result === 'object') {
+                if (result.downloadUrl) {
+                    setDownloadUrl(result.downloadUrl);
+                    setServerStatus('Resultado listo para descargar');
+                } else {
+                    // Iniciamos polling usando planillaId devuelto por el servidor o el planillaId local generado
+                    const remoteId = result.planillaId ?? planillaId;
+                    startPolling(remoteId);
+                }
+            }
+
             Alert.alert(
-                '¡Enviado!',
-                `El documento se está procesando. ID: ${planillaId}. El Excel estará listo pronto.`,
+                '¡Proceso Completado!',
+                `El documento se proceso con exito.`,
                 [{ text: 'OK', onPress: () => router.replace('/') }]
             );
 
-            console.log("Respuesta de n8n:", result);
+            // Evitar volcar binarios en consola
+            if (result?.raw && typeof result.raw === 'string' && result.raw.includes('PK')) {
+                console.log('Respuesta de n8n: archivo binario recibido (omitiendo volcado)');
+            } else {
+                console.log('Respuesta de n8n:', result);
+            }
         } catch (err: any) {
             console.error('Upload error', err, 'serverResponse:', err?.serverResponse ?? null);
             Alert.alert(
@@ -159,6 +192,15 @@ export default function PreviewScreen() {
             );
         } finally {
             setIsUploading(false);
+            // si iniciamos polling y no hay progreso real, damos un progreso 'falso' hasta que el servidor responda
+            if (!polling && !downloadUrl) {
+                // animar progreso lento hasta 80%
+                let p = uploadProgress;
+                fakeProgressRef.current = setInterval(() => {
+                    p = Math.min(80, p + Math.random() * 6);
+                    setUploadProgress(Math.round(p));
+                }, 800) as unknown as number;
+            }
         }
     };
 
@@ -189,6 +231,198 @@ export default function PreviewScreen() {
                 console.error('link open error', linkErr);
                 Alert.alert('Error', 'No se pudo abrir el PDF. Ruta: ' + pdfUri);
             }
+        }
+    };
+
+    /**
+     * Polling para progreso en backend. Usa la variable de entorno EXPO_PUBLIC_BACKEND_BASE
+     */
+    const startPolling = (planillaId: string) => {
+        const BACKEND = process.env.EXPO_PUBLIC_BACKEND_BASE;
+        console.debug('startPolling called with', planillaId, 'BACKEND=', BACKEND);
+        if (!BACKEND) {
+            console.warn('No EXPO_PUBLIC_BACKEND_BASE definido; no se puede iniciar polling');
+            setServerStatus('En procesamiento (no disponible el progreso)');
+            return;
+        }
+
+        // Si ya hay polling para la misma planilla, no arrancamos otro
+        if (pollRef.current && polledIdRef.current === planillaId) {
+            console.debug('Polling ya en curso para esta planilla:', planillaId);
+            return;
+        }
+
+        // Si hay polling para otra planilla, detenemos y reiniciamos
+        if (pollRef.current && polledIdRef.current !== planillaId) {
+            console.debug('Cambiando polling desde', polledIdRef.current, 'a', planillaId);
+            clearInterval(pollRef.current as unknown as number);
+            pollRef.current = null;
+            polledIdRef.current = null;
+        }
+
+        // detener animación falsa si existe
+        if (fakeProgressRef.current) {
+            clearInterval(fakeProgressRef.current as unknown as number);
+            fakeProgressRef.current = null;
+        }
+
+        setPolling(true);
+        setServerStatus('Verificando progreso...');
+        polledIdRef.current = planillaId;
+
+        // Hacemos una petición inmediata para obtener estado actual sin esperar el primer intervalo
+        (async () => {
+            try {
+                console.debug('Immediate polling fetch for', planillaId);
+                const res0 = await fetch(`${BACKEND}/api/v1/inventory/${planillaId}/progress`);
+                if (res0.ok) {
+                    const j0 = await res0.json();
+                    console.debug('Immediate polling response', j0);
+                    if (j0.progress !== undefined) setUploadProgress(Math.max(0, Math.min(100, Number(j0.progress))));
+                    if (j0.message) setServerStatus(j0.message);
+                    if (j0.status === 'completed') {
+                        if (j0.downloadUrl) setDownloadUrl(j0.downloadUrl);
+                        stopPolling();
+                        setServerStatus('Completado');
+                        setUploadProgress(100);
+                        return;
+                    }
+                }
+            } catch (e) {
+                console.warn('Immediate polling error', e);
+            }
+
+            // Iniciar intervalo regular
+            pollRef.current = setInterval(async () => {
+                try {
+                    console.debug('Polling fetch for', planillaId);
+                    const res = await fetch(`${BACKEND}/api/v1/inventory/${planillaId}/progress`);
+                    if (!res.ok) {
+                        console.warn('Polling error status', res.status);
+                        return;
+                    }
+                    const j = await res.json();
+                    console.debug('Polling response', j);
+                    if (j.progress !== undefined) {
+                        setUploadProgress(Math.max(0, Math.min(100, Number(j.progress))));
+                    }
+                    if (j.message) setServerStatus(j.message);
+                    if (j.status === 'completed') {
+                        // detener polling y mostrar URL si existe
+                        if (j.downloadUrl) setDownloadUrl(j.downloadUrl);
+                        stopPolling();
+                        setServerStatus('Completado');
+                        setUploadProgress(100);
+                    }
+                    if (j.status === 'error') {
+                        stopPolling();
+                        setServerStatus('Error en procesamiento');
+                    }
+                } catch (e) {
+                    console.warn('Polling error', e);
+                }
+            }, 3000) as unknown as number;
+        })();
+    };
+
+    const stopPolling = () => {
+        if (pollRef.current) {
+            clearInterval(pollRef.current as unknown as number);
+            pollRef.current = null;
+        }
+        setPolling(false);
+        if (fakeProgressRef.current) {
+            clearInterval(fakeProgressRef.current as unknown as number);
+            fakeProgressRef.current = null;
+        }
+    };
+
+    // limpiar al desmontar
+    useEffect(() => {
+        return () => {
+            stopPolling();
+        };
+    }, []);
+
+    // Si cambia downloadUrl o polling, cancelar fake progress
+    useEffect(() => {
+        if (downloadUrl || polling) {
+            if (fakeProgressRef.current) {
+                clearInterval(fakeProgressRef.current as unknown as number);
+                fakeProgressRef.current = null;
+            }
+        }
+    }, [downloadUrl, polling]);
+
+    const downloadResult = async () => {
+        if (!downloadUrl) {
+            Alert.alert('No disponible', 'Aún no hay URL de descarga.');
+            return;
+        }
+
+        try {
+            setServerStatus('Descargando resultado...');
+            const fileName = downloadUrl.split('/').pop() ?? `resultado_${Date.now()}.xlsx`;
+            const documentDir = (FileSystem as any).documentDirectory ?? (FileSystem as any).cacheDirectory ?? '/';
+            const dest = `${documentDir}${fileName}`;
+            const dl = await FileSystem.downloadAsync(downloadUrl, dest);
+            setLocalFileUri(dl.uri);
+            setServerStatus('Descargado');
+            Alert.alert('Descargado', `Archivo guardado en: ${dl.uri}`);
+        } catch (e) {
+            console.error('Download error', e);
+            Alert.alert('Error', 'No se pudo descargar el archivo.');
+            setServerStatus('Error al descargar');
+        }
+    };
+
+    const saveToGallery = async () => {
+        if (!localFileUri) {
+            Alert.alert('No disponible', 'Primero descarga el archivo.');
+            return;
+        }
+        try {
+            const { status } = await (await import('expo-media-library')).requestPermissionsAsync();
+            if (status !== 'granted') {
+                Alert.alert('Permiso denegado', 'No se pudo obtener permiso para guardar en la galería.');
+                return;
+            }
+            const MediaLibrary = await import('expo-media-library');
+            const asset = await MediaLibrary.createAssetAsync(localFileUri);
+            await MediaLibrary.createAlbumAsync('DigiStock', asset, false);
+            Alert.alert('Guardado', 'El archivo fue guardado en la galería.');
+        } catch (e) {
+            console.error('save to gallery error', e);
+            Alert.alert('Error', 'No se pudo guardar en la galería.');
+        }
+    };
+
+    const shareResult = async () => {
+        if (!localFileUri && downloadUrl) {
+            // si no hay local, intentamos descargar temporalmente
+            try {
+                const fileName = downloadUrl.split('/').pop() ?? `resultado_${Date.now()}.xlsx`;
+                const documentDir = (FileSystem as any).documentDirectory ?? (FileSystem as any).cacheDirectory ?? '/';
+                const dest = `${documentDir}${fileName}`;
+                const dl = await FileSystem.downloadAsync(downloadUrl, dest);
+                setLocalFileUri(dl.uri);
+            } catch (e) {
+                console.error('share download error', e);
+                Alert.alert('Error', 'No se pudo preparar el archivo para compartir.');
+                return;
+            }
+        }
+
+        if (!localFileUri) {
+            Alert.alert('No disponible', 'No hay archivo local para compartir.');
+            return;
+        }
+
+        try {
+            await import('expo-sharing').then(sh => sh.shareAsync(localFileUri!));
+        } catch (e) {
+            console.error('share error', e);
+            Alert.alert('Error', 'No se pudo compartir el archivo.');
         }
     };
 
@@ -266,7 +500,7 @@ export default function PreviewScreen() {
                 </TouchableOpacity>
 
                 {/* Barra de progreso simple */}
-                {isUploading && (
+                {(isUploading || polling || downloadUrl) && (
                     <View style={styles.progressWrap}>
                         <View style={styles.progressBarBackground}>
                             <View style={[styles.progressBarFill, { width: `${uploadProgress}%` }]} />
@@ -274,8 +508,34 @@ export default function PreviewScreen() {
                         <ThemedText style={{ fontSize: 12 }}>{uploadProgress}%</ThemedText>
                         {serverStatus && <ThemedText style={{ fontSize: 12, marginLeft: 8 }}>{serverStatus}</ThemedText>}
                     </View>
-                )
-                }
+                )}
+
+                {/* Si ya hay URL de descarga, mostrar botones de acción */}
+                {downloadUrl && (
+                    <View style={{ marginLeft: 12, flexDirection: 'row', gap: 8 }}>
+                        <TouchableOpacity style={[styles.sendButton]} onPress={downloadResult}>
+                            <ThemedText style={styles.sendText}>Descargar Resultado</ThemedText>
+                        </TouchableOpacity>
+                        <TouchableOpacity style={[styles.openButton]} onPress={shareResult}>
+                            <ThemedText style={styles.openText}>Compartir</ThemedText>
+                        </TouchableOpacity>
+                        <TouchableOpacity style={[styles.openButton]} onPress={saveToGallery}>
+                            <ThemedText style={styles.openText}>Guardar</ThemedText>
+                        </TouchableOpacity>
+                    </View>
+                )}
+
+                {/* Si ya hay archivo local, mostrar opción de abrir */}
+                {localFileUri && (
+                    <View style={{ marginLeft: 12 }}>
+                        <TouchableOpacity style={[styles.openButton]} onPress={async () => {
+                            try { await import('expo-sharing').then(sh => sh.shareAsync(localFileUri)); }
+                            catch (e) { console.error(e); }
+                        }}>
+                            <ThemedText style={styles.openText}>Abrir</ThemedText>
+                        </TouchableOpacity>
+                    </View>
+                )}
             </View>
         </View>
     );
