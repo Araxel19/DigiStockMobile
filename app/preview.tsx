@@ -2,7 +2,7 @@ import { ThemedText } from '@/components/themed-text';
 import { useThemeColor } from '@/hooks/use-theme-color';
 import { uploadPdfToN8n } from '@/services/n8nApi';
 import { Ionicons } from '@expo/vector-icons';
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 import * as ImageManipulator from 'expo-image-manipulator';
 import * as Print from 'expo-print';
 import { useLocalSearchParams, useRouter } from 'expo-router';
@@ -19,6 +19,41 @@ export default function PreviewScreen() {
     const [serverStatus, setServerStatus] = useState<string | null>(null);
     const [lastPollResponse, setLastPollResponse] = useState<any | null>(null);
     const progressAnimRef = useRef<number | null>(null);
+    const progressValueRef = useRef<number>(0);
+
+    const updateProgressImmediate = (v: number) => {
+        const safe = Math.max(0, Math.min(100, Math.round(v)));
+        progressValueRef.current = safe;
+        setUploadProgress(safe);
+    };
+
+    const smoothSetProgress = (target: number) => {
+        target = Math.max(0, Math.min(100, Math.round(target)));
+        // si hay una animación en curso, cancélala
+        if (progressAnimRef.current) {
+            clearInterval(progressAnimRef.current as unknown as number);
+            progressAnimRef.current = null;
+        }
+
+        const stepInterval = 350; // ms
+        progressAnimRef.current = setInterval(() => {
+            const current = progressValueRef.current;
+            if (current >= target) {
+                clearInterval(progressAnimRef.current as unknown as number);
+                progressAnimRef.current = null;
+                progressValueRef.current = target;
+                setUploadProgress(target);
+                return;
+            }
+            // step: 1..3 depending on gap, keep slow visual
+            const gap = target - current;
+            const step = Math.max(1, Math.min(3, Math.ceil(gap / 6)));
+            const next = Math.min(target, current + step);
+            progressValueRef.current = next;
+            setUploadProgress(next);
+        }, stepInterval) as unknown as number;
+    };
+
     const router = useRouter();
 
     // Convertimos el parámetro de string a array
@@ -135,7 +170,7 @@ export default function PreviewScreen() {
                 console.warn('No se pudo obtener info del PDF:', infoErr);
             }
 
-            setUploadProgress(0);
+            updateProgressImmediate(0);
             setServerStatus('Subiendo...');
 
             // Iniciamos la subida pero no esperamos antes de arrancar polling: esto permite mostrar progreso del servidor incluso si tarda en responder
@@ -146,13 +181,13 @@ export default function PreviewScreen() {
             }, {
                 timeoutMs: 5 * 60 * 1000, // 5 minutos
                 onUploadProgress: (p) => {
-                    setUploadProgress(p);
+                    updateProgressImmediate(p);
                 }
             });
 
             // arrancar polling inmediato con el planillaId local (evita que la barra se quede en 0 si el servidor notifica progreso)
             // También forzamos un progreso mínimo visible
-            setUploadProgress(1);
+            updateProgressImmediate(1);
             startPolling(planillaId);
 
             const result = await uploadPromise;
@@ -172,18 +207,49 @@ export default function PreviewScreen() {
                 }
             }
 
-            Alert.alert(
-                '¡Proceso Completado!',
-                `El documento se proceso con exito.`,
-                [{ text: 'OK', onPress: () => router.replace('/') }]
-            );
-
-            // Evitar volcar binarios en consola
+            // Si la respuesta contiene el archivo en bruto (zip/xlsx) intentamos guardarlo localmente
             if (result?.raw && typeof result.raw === 'string' && result.raw.includes('PK')) {
-                console.log('Respuesta de n8n: archivo binario recibido (omitiendo volcado)');
+                try {
+                    const fileName = `resultado_${planillaId}.xlsx`;
+                    const documentDir = (FileSystem as any).documentDirectory ?? (FileSystem as any).cacheDirectory ?? '/';
+                    const dest = `${documentDir}${fileName}`;
+                    await FileSystem.writeAsStringAsync(dest, result.raw as string, { encoding: FileSystem.EncodingType.UTF8 });
+                    setLocalFileUri(dest);
+                    setServerStatus('Archivo recibido y guardado localmente');
+                    console.log('Archivo guardado en:', dest);
+                } catch (saveErr) {
+                    console.warn('No se pudo guardar el archivo recibido:', saveErr);
+                }
+            }
+
+            // Evitar volcar binarios en consola si estaba en raw
+            if (result?.raw && typeof result.raw === 'string' && result.raw.includes('PK')) {
+                console.log('Respuesta de n8n: archivo binario recibido (guardado localmente si fue posible)');
             } else {
                 console.log('Respuesta de n8n:', result);
             }
+
+            // Mejor alerta con acciones
+            const actions: any[] = [];
+            if (localFileUri || downloadUrl) {
+                actions.push({ text: 'Ver resultado', onPress: async () => {
+                    try {
+                        if (localFileUri) {
+                            if (Platform.OS === 'android') {
+                                try { const contentUri = await FileSystem.getContentUriAsync(localFileUri); await import('expo-sharing').then(sh => sh.shareAsync(contentUri)); return; } catch (e) { /* fallback */ }
+                            }
+                            await import('expo-sharing').then(sh => sh.shareAsync(localFileUri));
+                        } else {
+                            await downloadResult();
+                        }
+                    } catch (e) { console.error(e); Alert.alert('Error', 'No se pudo abrir el resultado.'); }
+                } });
+            }
+
+            actions.push({ text: 'Ir al inicio', onPress: () => router.replace('/') });
+            actions.push({ text: 'Cerrar', style: 'cancel' });
+
+            Alert.alert('¡Proceso Completado!', 'El documento se procesó con éxito.', actions);
         } catch (err: any) {
             console.error('Upload error', err, 'serverResponse:', err?.serverResponse ?? null);
             Alert.alert(
@@ -198,7 +264,7 @@ export default function PreviewScreen() {
                 let p = uploadProgress;
                 fakeProgressRef.current = setInterval(() => {
                     p = Math.min(80, p + Math.random() * 6);
-                    setUploadProgress(Math.round(p));
+                    updateProgressImmediate(Math.round(p));
                 }, 800) as unknown as number;
             }
         }
@@ -278,13 +344,13 @@ export default function PreviewScreen() {
                 if (res0.ok) {
                     const j0 = await res0.json();
                     console.debug('Immediate polling response', j0);
-                    if (j0.progress !== undefined) setUploadProgress(Math.max(0, Math.min(100, Number(j0.progress))));
+                    if (j0.progress !== undefined) smoothSetProgress(Math.max(0, Math.min(100, Number(j0.progress))));
                     if (j0.message) setServerStatus(j0.message);
                     if (j0.status === 'completed') {
                         if (j0.downloadUrl) setDownloadUrl(j0.downloadUrl);
                         stopPolling();
                         setServerStatus('Completado');
-                        setUploadProgress(100);
+                        smoothSetProgress(100);
                         return;
                     }
                 }
@@ -304,15 +370,17 @@ export default function PreviewScreen() {
                     const j = await res.json();
                     console.debug('Polling response', j);
                     if (j.progress !== undefined) {
-                        setUploadProgress(Math.max(0, Math.min(100, Number(j.progress))));
+                        // animar suavemente hacia el nuevo valor
+                        smoothSetProgress(Number(j.progress));
                     }
                     if (j.message) setServerStatus(j.message);
+                    setLastPollResponse(j);
                     if (j.status === 'completed') {
                         // detener polling y mostrar URL si existe
                         if (j.downloadUrl) setDownloadUrl(j.downloadUrl);
                         stopPolling();
                         setServerStatus('Completado');
-                        setUploadProgress(100);
+                        smoothSetProgress(100);
                     }
                     if (j.status === 'error') {
                         stopPolling();
@@ -483,6 +551,33 @@ export default function PreviewScreen() {
                 </View>
             )}
 
+            {/* Resultado (si existe archivo local o URL de descarga) */}
+            {(downloadUrl || localFileUri) && (
+                <View style={styles.resultCard}>
+                    <ThemedText style={{ fontWeight: '700', marginBottom: 6 }}>Resultado disponible</ThemedText>
+                    <ThemedText numberOfLines={1} style={{ marginBottom: 8 }}>{(localFileUri || downloadUrl)?.split('/').pop()}</ThemedText>
+                    <View style={{ flexDirection: 'row', gap: 8 }}>
+                        <TouchableOpacity style={[styles.openButton]} onPress={async () => {
+                            try {
+                                const uri = localFileUri ?? downloadUrl!;
+                                if (Platform.OS === 'android') {
+                                    try { const contentUri = await FileSystem.getContentUriAsync(uri); await import('expo-sharing').then(sh => sh.shareAsync(contentUri)); return; } catch (e) { /* fallback */ }
+                                }
+                                await import('expo-sharing').then(sh => sh.shareAsync(uri));
+                            } catch (e) { console.error(e); Alert.alert('Error', 'No se pudo abrir el archivo.'); }
+                        }}>
+                            <ThemedText style={styles.openText}>Abrir / Compartir</ThemedText>
+                        </TouchableOpacity>
+                        <TouchableOpacity style={[styles.openButton]} onPress={saveToGallery}>
+                            <ThemedText style={styles.openText}>Guardar</ThemedText>
+                        </TouchableOpacity>
+                        <TouchableOpacity style={[styles.sendButton]} onPress={downloadResult}>
+                            <ThemedText style={styles.sendText}>Descargar</ThemedText>
+                        </TouchableOpacity>
+                    </View>
+                </View>
+            )}
+
             <View style={[styles.footer, { backgroundColor: bg }]}>
                 <TouchableOpacity
                     style={[styles.sendButton, (isUploading || isGenerating) && { opacity: 0.5 }]}
@@ -559,7 +654,7 @@ const styles = StyleSheet.create({
 
     footer: { flexDirection: 'row', padding: 16, borderTopWidth: 1, borderTopColor: '#e6e9ee', gap: 10, backgroundColor: 'white' },
 
-    sendButton: { flex: 2, flexDirection: 'row', padding: 12, borderRadius: 10, backgroundColor: '#2ecc71', justifyContent: 'center', alignItems: 'center', gap: 8 },
+    sendButton: { width: 150, flexDirection: 'row', padding: 12, borderRadius: 10, backgroundColor: '#2ecc71', justifyContent: 'center', alignItems: 'center', gap: 8 },
     openButton: { flex: 1, flexDirection: 'row', padding: 12, borderRadius: 10, backgroundColor: '#007AFF', justifyContent: 'center', alignItems: 'center', gap: 8 },
 
     buttonText: { color: 'white', fontWeight: '700' },
@@ -568,7 +663,9 @@ const styles = StyleSheet.create({
 
     progressWrap: { flexDirection: 'row', alignItems: 'center', gap: 8, marginLeft: 12 },
     progressBarBackground: { width: 140, height: 8, backgroundColor: '#e6e9ee', borderRadius: 6, overflow: 'hidden', marginRight: 8 },
-    progressBarFill: { height: 8, backgroundColor: '#2ecc71' }
+    progressBarFill: { height: 8, backgroundColor: '#2ecc71' },
+
+    resultCard: { padding: 12, backgroundColor: '#fff', margin: 12, borderRadius: 8, borderWidth: 1, borderColor: '#e6e9ee' }
 });
 
 export const screenOptions = {
